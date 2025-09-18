@@ -1,202 +1,115 @@
+// index.js
 const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
 const prisma = new PrismaClient();
 const server = http.createServer(app);
-const io = new Server(server);
+const io = new Server(server, { cors: { origin: "*" } });
 
+app.use(cors());
 app.use(express.json());
 
-// Home route
-app.get('/', (req, res) => {
-  res.send('Move37 Backend is running!');
+const PORT = 3000;
+
+// WebSocket connection
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+  });
 });
 
-// Get all users
-app.get('/users', async (req, res) => {
-  try {
-    const users = await prisma.user.findMany();
-    res.json(users);
-  } catch (error) {
-    res.status(500).json({ error: "Unable to fetch users" });
-  }
-});
-
-// Create new user
+// ==================== USERS ====================
 app.post('/users', async (req, res) => {
-  const { name, email, passwordHash } = req.body;
   try {
+    const { name, email, passwordHash } = req.body;
     const user = await prisma.user.create({
-      data: {
-        name,
-        email,
-        passwordHash
-      },
+      data: { name, email, passwordHash }
     });
     res.json(user);
-  } catch (error) {
-    res.status(500).json({ error: "Unable to create user" });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
-// Create new poll
+app.get('/users', async (req, res) => {
+  const users = await prisma.user.findMany();
+  res.json(users);
+});
+
+// ==================== POLLS ====================
 app.post('/polls', async (req, res) => {
-  const { question, creatorId, options } = req.body;
   try {
+    const { question, creatorId, options } = req.body;
     const poll = await prisma.poll.create({
       data: {
         question,
         creatorId,
         options: {
-          create: options.map(text => ({ text }))
+          create: options.map((opt) => ({ text: opt }))
         }
       },
-      include: {
-        options: true
-      }
+      include: { options: true }
     });
     res.json(poll);
-  } catch (error) {
-    res.status(500).json({ error: "Unable to create poll", details: error.message });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
-// Get all polls
 app.get('/polls', async (req, res) => {
-  try {
-    const polls = await prisma.poll.findMany({
-      include: {
-        options: true,
-        creator: true
-      }
-    });
-    res.json(polls);
-  } catch (error) {
-    res.status(500).json({ error: "Unable to fetch polls" });
-  }
+  const polls = await prisma.poll.findMany({ include: { options: true } });
+  res.json(polls);
 });
 
-// Submit a vote
+// ==================== VOTES ====================
 app.post('/vote', async (req, res) => {
-  const { userId, optionId, pollId } = req.body;
   try {
+    const { userId, pollOptionId } = req.body;
+
+    // create vote
     const vote = await prisma.vote.create({
-      data: {
-        userId,
-        optionId
-      }
+      data: { userId, pollOptionId }
     });
 
-    // After vote, emit updated results
-    const poll = await prisma.poll.findUnique({
-      where: { id: pollId },
-      include: {
-        options: {
-          include: {
-            votes: true
-          }
-        }
-      }
+    // get updated vote count for this poll option
+    const votesCount = await prisma.vote.count({
+      where: { pollOptionId }
     });
 
-    const results = poll.options.map(option => ({
-      id: option.id,
-      text: option.text,
-      voteCount: option.votes.length
-    }));
-
-    io.to(`poll_${pollId}`).emit('pollResults', results);
+    // broadcast to all connected clients
+    io.emit('voteUpdate', { pollOptionId, votes: votesCount });
 
     res.json(vote);
-  } catch (error) {
-    res.status(500).json({ error: "Unable to submit vote", details: error.message });
+  } catch (err) {
+    res.status(400).json({ error: 'User may have already voted or invalid data' });
   }
 });
 
-// Get poll results
-app.get('/poll/:id/results', async (req, res) => {
-  const pollId = parseInt(req.params.id);
+// ==================== GET POLL RESULTS ====================
+app.get('/poll/:pollId/results', async (req, res) => {
+  const { pollId } = req.params;
   try {
-    const poll = await prisma.poll.findUnique({
-      where: { id: pollId },
-      include: {
-        options: {
-          include: {
-            votes: true
-          }
-        }
-      }
+    const options = await prisma.pollOption.findMany({
+      where: { pollId: parseInt(pollId) },
+      include: { votes: true }
     });
 
-    if (!poll) {
-      return res.status(404).json({ error: "Poll not found" });
-    }
-
-    const results = poll.options.map(option => ({
-      id: option.id,
-      text: option.text,
-      voteCount: option.votes.length
+    const results = options.map((opt) => ({
+      optionId: opt.id,
+      text: opt.text,
+      votes: opt.votes.length
     }));
 
-    res.json({ pollId: poll.id, question: poll.question, results });
-  } catch (error) {
-    res.status(500).json({ error: "Unable to fetch poll results", details: error.message });
+    res.json(results);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 
-// WebSocket connection
-io.on('connection', (socket) => {
-  console.log('A user connected');
-
-  socket.on('joinPoll', (pollId) => {
-    socket.join(`poll_${pollId}`);
-    console.log('User joined poll', pollId);
-  });
-
-  socket.on('vote', async (data) => {
-    const { userId, optionId, pollId } = data;
-    try {
-      await prisma.vote.create({
-        data: {
-          userId,
-          optionId
-        }
-      });
-
-      const poll = await prisma.poll.findUnique({
-        where: { id: pollId },
-        include: {
-          options: {
-            include: {
-              votes: true
-            }
-          }
-        }
-      });
-
-      const results = poll.options.map(option => ({
-        id: option.id,
-        text: option.text,
-        voteCount: option.votes.length
-      }));
-
-      io.to(`poll_${pollId}`).emit('pollResults', results);
-
-    } catch (error) {
-      socket.emit('error', { message: "Vote failed", details: error.message });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    console.log('A user disconnected');
-  });
-});
-
-// Start server
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// ==================== START SERVER ====================
+server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
